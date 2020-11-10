@@ -1,0 +1,17 @@
+[package]
+name = "latitude"
+version = "0.0.1"
+authors = ["nkconnor <latitude@nconnor.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+barrel = {version="0.6", features=['sqlite3', 'mysql']}
+sqlx = { path= "/home/nconnor/repos/sqlx", default-features = false, features = ["runtime-tokio", "macros", "any", "mysql", "chrono", "decimal", "sqlite"] }
+async-trait = "0.1"
+thiserror = "1"
+
+[dev_dependencies]
+tokio = "0.2"
