@@ -10,7 +10,8 @@ in the near future.
 Originally this was intended to to be a migration toolkit, but, it has been slimmed down. It's
 unclear if we will still pursue a migration oriented API. Adding migration capability would be
 a feature addition as opposed to a rewrite.
-With the migratio changes this library could be considered amore portable but less
+
+With the migration changes this library could be considered amore portable but less
 accessible alternative to `sqlx-cli`: users require less concern over understanding and
 maintaining multiple SQL dialects, but, must have familiarity with Rust to get up and
 running. It may be a good fit if your application is already written in Rust and either:
@@ -36,12 +37,18 @@ use latitude::prelude::*;
 
 let connection = Connection::new("sqlite::memory:").await?;
 
+db::create().execute(&connection).await?;
+
+let date_updated = date().nullable(true);
+
 table::create("users")
       .column("name", varchar(255))
       .column("age",  integer())
-      .column("xyx",  boolean())
+      .column("date_updated", date_updated)
       .execute(&mut connection)
       .await?
+
+db::drop().execute(&connection).await?;
 ```
 
 License: MIT OR Apache-2.0
