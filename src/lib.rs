@@ -38,12 +38,12 @@
 //!       .column("name", varchar(255))
 //!       .column("age",  integer())
 //!       .column("xyx",  boolean())
-//!       .execute(&mut connection)
+//!       .execute(&connection)
 //!       .await?
 //! ```
 use async_trait::async_trait;
 use barrel::Migration;
-use sqlx::{any::AnyConnection, any::AnyDone, any::AnyKind, Any};
+use sqlx::{any::AnyKind, any::AnyPool, Any};
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -51,15 +51,38 @@ pub use barrel::types;
 
 /// Exports commonly used types and modules
 pub mod prelude {
+    pub use crate::db;
     pub use crate::table;
+    pub use crate::table::CreateTable;
     pub use crate::types;
     pub use crate::types::boolean;
     pub use crate::types::date;
     pub use crate::types::integer;
     pub use crate::types::primary;
+    pub use crate::types::text;
     pub use crate::types::varchar;
     pub use crate::Connection;
     pub use crate::Statement;
+}
+
+pub mod db {
+    /// A `DROP DATABASE` statement. This is a permanent action
+    /// and the data will most likely be non-recoverable.
+    pub struct DropDatabase {}
+
+    /// A `CREATE DATABASE` statement.
+    pub struct CreateDatabase {}
+
+    /// Create a `DropDatabase` statement. This is a permanent action
+    /// and the data will most likely be non-recoverable.
+    pub fn drop() -> DropDatabase {
+        DropDatabase {}
+    }
+
+    /// Create a `CreateDatabase` statement
+    pub fn create() -> CreateDatabase {
+        CreateDatabase {}
+    }
 }
 
 /// DDL operations for tables such as `CREATE`, `DROP`, and `ALTER`
@@ -122,6 +145,7 @@ pub mod table {
 
     /// A `DROP TABLE` statement
     pub struct DropTable {
+        #[allow(dead_code)]
         pub(crate) name: String,
         pub(crate) if_exists: bool,
     }
@@ -156,7 +180,7 @@ pub mod table {
 /// for now, but, it should be removed in the not-so-far future.
 pub struct Connection {
     uri: String,
-    inner: AnyConnection,
+    inner: Option<AnyPool>,
 }
 
 impl Connection {
@@ -169,10 +193,27 @@ impl Connection {
     /// Connection::new("sqlite::memory:").unwrap();
     /// ```
     pub async fn new<URI: Into<String>>(uri: URI) -> Result<Self, sqlx::Error> {
-        use sqlx::Connection;
-        let uri = uri.into();
-        let inner = AnyConnection::connect(uri.clone().as_str()).await?;
-        Ok(Self { uri, inner })
+        Ok(Self {
+            uri: uri.into(),
+            inner: None,
+        })
+    }
+
+    pub async fn acquire(&mut self) -> Result<&AnyPool, sqlx::Error> {
+        if self.inner.is_none() {
+            let inner = sqlx::any::AnyPoolOptions::new()
+                .connect(self.uri.as_str())
+                .await?;
+
+            self.inner = Some(inner);
+        }
+
+        Ok(&self.inner.as_ref().unwrap())
+    }
+
+    pub async fn take(mut self) -> Result<AnyPool, sqlx::Error> {
+        self.acquire().await?;
+        Ok(self.inner.take().unwrap())
     }
 
     /// Parse the SQL dialect for this connection's URI.
@@ -194,20 +235,57 @@ enum Error {
 #[async_trait]
 pub trait Statement: Sized {
     /// Create a String DDL statement for the given SQL Dialect
-    fn for_dialect(self, dialect: AnyKind) -> Result<String, sqlx::Error>;
+    fn into_string(self, dialect: AnyKind) -> Result<String, sqlx::Error>;
 
     /// Execute the DDL statement
-    async fn execute(self, conn: &mut Connection) -> Result<AnyDone, sqlx::Error> {
+    async fn execute(self, conn: &mut Connection) -> Result<(), sqlx::Error> {
         let dialect = conn.dialect()?;
-        let statement = self.for_dialect(dialect)?;
+        let statement = self.into_string(dialect)?;
+        // TODO trace::debug!(..)
         sqlx::query::<Any>(statement.as_str())
-            .execute(&mut conn.inner)
-            .await
+            .execute(conn.acquire().await?)
+            .await?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Statement for db::CreateDatabase {
+    fn into_string(self, _dialect: AnyKind) -> Result<String, sqlx::Error> {
+        Err(sqlx::Error::Configuration(Box::new(
+            Error::UnsupportedDialect,
+        )))
+    }
+
+    /// Execute the DDL statement
+    async fn execute(self, conn: &mut Connection) -> Result<(), sqlx::Error> {
+        use sqlx::migrate::MigrateDatabase;
+        Any::create_database(conn.uri.as_str()).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Statement for db::DropDatabase {
+    fn into_string(self, _dialect: AnyKind) -> Result<String, sqlx::Error> {
+        Err(sqlx::Error::Configuration(Box::new(
+            Error::UnsupportedDialect,
+        )))
+    }
+
+    /// Execute the DDL statement
+    async fn execute(self, conn: &mut Connection) -> Result<(), sqlx::Error> {
+        use sqlx::migrate::MigrateDatabase;
+        if Any::database_exists(conn.uri.as_str()).await? {
+            Any::drop_database(conn.uri.as_str()).await?;
+        }
+        return Ok(());
     }
 }
 
 impl Statement for table::CreateTable {
-    fn for_dialect(self, dialect: AnyKind) -> Result<String, sqlx::Error> {
+    fn into_string(self, dialect: AnyKind) -> Result<String, sqlx::Error> {
         let mut migration = Migration::new();
         if self.if_not_exists {
             migration.create_table_if_not_exists(self.name.clone(), move |table| {
@@ -215,25 +293,32 @@ impl Statement for table::CreateTable {
                     table.add_column(name, ty);
                 }
             });
+        } else {
+            migration.create_table(self.name.clone(), move |table| {
+                for (name, ty) in self.columns.clone() {
+                    table.add_column(name, ty);
+                }
+            });
         }
 
-        migration.for_dialect(dialect)
+        migration.into_string(dialect)
     }
 }
 
 impl Statement for Migration {
-    fn for_dialect(self, dialect: AnyKind) -> Result<String, sqlx::Error> {
+    fn into_string(self, dialect: AnyKind) -> Result<String, sqlx::Error> {
         let variant = match dialect {
             AnyKind::MySql => Some(barrel::backend::SqlVariant::Mysql),
             AnyKind::Sqlite => Some(barrel::backend::SqlVariant::Sqlite),
+            #[allow(unreachable_patterns)]
             _ => None,
         };
 
-        let variant = variant
-            .map(Ok)
-            .unwrap_or(Err(sqlx::Error::Configuration(Box::new(
+        let variant = variant.map(Ok).unwrap_or_else(|| {
+            Err(sqlx::Error::Configuration(Box::new(
                 Error::UnsupportedDialect,
-            ))))?;
+            )))
+        })?;
 
         Ok(self.make_from(variant))
     }
@@ -248,7 +333,7 @@ impl Statement for Migration {
 //
 //    async fn _migrate(
 //        self,
-//        mut conn: AnyConnection,
+//        mut conn: AnyPool,
 //        variant: barrel::backend::SqlVariant,
 //    ) -> Result<(), sqlx::Error> {
 //        let mut global = conn.begin().await?;
@@ -336,7 +421,7 @@ impl Statement for Migration {
 //            _ => panic!(),
 //        };
 //
-//        let mut conn = AnyConnection::connect(uri).await?;
+//        let mut conn = AnyPool::connect(uri).await?;
 //        self._migrate(conn, variant).await
 //    }
 //}
@@ -347,6 +432,6 @@ mod tests {
     #[tokio::test(threaded_scheduler)]
     async fn test_example_todos() {
         use crate::{table, Statement};
-        use sqlx::AnyConnection;
+        use sqlx::AnyPool;
     }
 }

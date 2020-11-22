@@ -14,7 +14,7 @@ readme = "README.md"
 [dependencies]
 
 barrel = {version="0.6", features=['sqlite3', 'mysql']}
-sqlx = { version="0.4.0-beta.1", default-features = false, features = ["runtime-tokio", "macros", "any", "mysql", "chrono", "decimal", "sqlite"] }
+sqlx = { path= "/home/nconnor/repos/sqlx", default-features = false, features = ["runtime-tokio-rustls", "macros", "any", "mysql", "chrono", "decimal", "sqlite", "migrate" ] }
 async-trait = "0.1"
 thiserror = "1"
 
