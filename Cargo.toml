@@ -14,7 +14,7 @@ readme = "README.md"
 [dependencies]
 
 barrel = {version="0.6", features=['sqlite3', 'mysql']}
-sqlx = { git= "https://github.com/nkconnor/sqlx", default-features = false, features = ["runtime-tokio-rustls", "macros", "any", "mysql", "chrono", "decimal", "sqlite", "migrate" ] }
+sqlx = { version="0.4.1", git= "https://github.com/nkconnor/sqlx", default-features = false, features = ["runtime-tokio-rustls", "macros", "any", "mysql", "chrono", "decimal", "sqlite", "migrate" ] }
 async-trait = "0.1"
 thiserror = "1"
 
