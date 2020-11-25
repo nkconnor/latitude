@@ -43,7 +43,7 @@
 //! ```
 use async_trait::async_trait;
 use barrel::Migration;
-use sqlx::{any::AnyKind, any::AnyPool, Any};
+use sqlx::{any::AnyKind, any::AnyPool, Any, Database, Executor};
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -61,7 +61,6 @@ pub mod prelude {
     pub use crate::types::primary;
     pub use crate::types::text;
     pub use crate::types::varchar;
-    pub use crate::Connection;
     pub use crate::Statement;
 }
 
@@ -176,59 +175,42 @@ pub mod table {
     }
 }
 
-/// A database connection wrapper over `sqlx::Connection`. I think that this is necessary
-/// for now, but, it should be removed in the not-so-far future.
-pub struct Connection {
-    uri: String,
-    inner: Option<AnyPool>,
-}
-
-impl Connection {
-    /// Create a new `Connection` from the given `uri`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crate::Connection;
-    /// Connection::new("sqlite::memory:").unwrap();
-    /// ```
-    pub async fn new<URI: Into<String>>(uri: URI) -> Result<Self, sqlx::Error> {
-        Ok(Self {
-            uri: uri.into(),
-            inner: None,
-        })
-    }
-
-    pub async fn acquire(&mut self) -> Result<&AnyPool, sqlx::Error> {
-        if self.inner.is_none() {
-            let inner = sqlx::any::AnyPoolOptions::new()
-                .connect(self.uri.as_str())
-                .await?;
-
-            self.inner = Some(inner);
-        }
-
-        Ok(&self.inner.as_ref().unwrap())
-    }
-
-    pub async fn take(mut self) -> Result<AnyPool, sqlx::Error> {
-        self.acquire().await?;
-        Ok(self.inner.take().unwrap())
-    }
-
-    /// Parse the SQL dialect for this connection's URI.
-    ///
-    /// Note: `sqlx::AnyKind` does not derive `Clone`, so this convenience function
-    /// gives us `AnyKind` from self reference on demand
-    fn dialect(&self) -> Result<AnyKind, sqlx::Error> {
-        AnyKind::from_str(self.uri.as_str())
-    }
-}
-
 #[derive(Debug, Error)]
 enum Error {
     #[error("Attempted to use an unsupported SQL dialect; available options are SQLite and MySQL")]
     UnsupportedDialect,
+}
+
+#[async_trait]
+pub trait Dialect {
+    fn dialect() -> AnyKind;
+
+    /// cant for the life of me get A: Acquire to work directly on statement
+    async fn execute_statement(&self, statement: &str) -> Result<(), sqlx::Error>;
+}
+
+#[async_trait]
+impl Dialect for sqlx::Pool<sqlx::Sqlite> {
+    fn dialect() -> AnyKind {
+        AnyKind::Sqlite
+    }
+
+    async fn execute_statement(&self, statement: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(statement).execute(self).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Dialect for sqlx::Pool<sqlx::MySql> {
+    fn dialect() -> AnyKind {
+        AnyKind::MySql
+    }
+
+    async fn execute_statement(&self, statement: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(statement).execute(self).await?;
+        Ok(())
+    }
 }
 
 /// An executable DDL Statement.
@@ -238,47 +220,36 @@ pub trait Statement: Sized {
     fn into_string(self, dialect: AnyKind) -> Result<String, sqlx::Error>;
 
     /// Execute the DDL statement
-    async fn execute(self, conn: &mut Connection) -> Result<(), sqlx::Error> {
-        let dialect = conn.dialect()?;
-        let statement = self.into_string(dialect)?;
-        // TODO trace::debug!(..)
-        sqlx::query::<Any>(statement.as_str())
-            .execute(conn.acquire().await?)
-            .await?;
+    /// NOTE/TODO: this should do something like conn: A: Acquire, but I couldn't get it to
+    /// work with async_trait's lifetime bounds
+    async fn execute<D: Dialect + Sync + Send>(self, conn: D) -> Result<(), sqlx::Error> {
+        let statement = self.into_string(D::dialect())?;
+        conn.execute_statement(statement.as_str()).await
+    }
+}
 
+#[async_trait]
+pub trait SystemStatement {
+    async fn execute(self, uri: &str) -> Result<(), sqlx::Error>;
+}
+
+#[async_trait]
+impl SystemStatement for db::CreateDatabase {
+    /// Execute the DDL statement
+    async fn execute(self, uri: &str) -> Result<(), sqlx::Error> {
+        use sqlx::migrate::MigrateDatabase;
+        Any::create_database(uri).await?;
         Ok(())
     }
 }
 
 #[async_trait]
-impl Statement for db::CreateDatabase {
-    fn into_string(self, _dialect: AnyKind) -> Result<String, sqlx::Error> {
-        Err(sqlx::Error::Configuration(Box::new(
-            Error::UnsupportedDialect,
-        )))
-    }
-
+impl SystemStatement for db::DropDatabase {
     /// Execute the DDL statement
-    async fn execute(self, conn: &mut Connection) -> Result<(), sqlx::Error> {
+    async fn execute(self, uri: &str) -> Result<(), sqlx::Error> {
         use sqlx::migrate::MigrateDatabase;
-        Any::create_database(conn.uri.as_str()).await?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl Statement for db::DropDatabase {
-    fn into_string(self, _dialect: AnyKind) -> Result<String, sqlx::Error> {
-        Err(sqlx::Error::Configuration(Box::new(
-            Error::UnsupportedDialect,
-        )))
-    }
-
-    /// Execute the DDL statement
-    async fn execute(self, conn: &mut Connection) -> Result<(), sqlx::Error> {
-        use sqlx::migrate::MigrateDatabase;
-        if Any::database_exists(conn.uri.as_str()).await? {
-            Any::drop_database(conn.uri.as_str()).await?;
+        if Any::database_exists(uri).await? {
+            Any::drop_database(uri).await?;
         }
         return Ok(());
     }
@@ -429,9 +400,9 @@ impl Statement for Migration {
 #[cfg(test)]
 mod tests {
 
-    #[tokio::test(threaded_scheduler)]
-    async fn test_example_todos() {
-        use crate::{table, Statement};
-        use sqlx::AnyPool;
-    }
+    //    #[tokio::test(threaded_scheduler)]
+    //    async fn test_example_todos() {
+    //        use crate::{table, Statement};
+    //        use sqlx::AnyPool;
+    //    }
 }
